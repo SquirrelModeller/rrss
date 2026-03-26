@@ -1,0 +1,13 @@
+# Python
+__pycache__
+
+# Nix
+.direnv
+.env
+
+# Database
+rss_data.db
+rrss_data.db-journal
+
+# Matrix
+matrix_store
