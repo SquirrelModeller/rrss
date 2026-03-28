@@ -24,7 +24,7 @@ from nio import (
     UnknownToDeviceEvent,
 )
 
-from sinks.matrix_config import MatrixConfig
+from sinks.matrix.matrix_config import MatrixConfig
 
 
 class VerificationBot:

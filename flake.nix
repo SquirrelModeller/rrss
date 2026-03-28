@@ -146,7 +146,7 @@
               exec systemd-run \
                 --uid=${cfg.user} \
                 --gid=${cfg.group} \
-                --working-directory=${cfg.stateDir} \
+                --working-directory=${self}/src \
                 --pty --wait \
                 --setenv=RRSS_STATE_DIR=${cfg.stateDir} \
                 --property=EnvironmentFile=${cfg.environmentFile} \
