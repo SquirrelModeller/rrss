@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from database import *
+import general_logic
 
 SINK = "matrix"
 
@@ -21,7 +22,7 @@ HELP_TEXT = """\
 """
 
 
-def dispatch(sender: str, body: str) -> str:
+async def dispatch(sender: str, body: str) -> str:
     """
     Main entry point.
 
@@ -53,7 +54,7 @@ def dispatch(sender: str, body: str) -> str:
         return _cmd_status()
 
     if command == "!add-feed":
-        return _cmd_add_feed(arg)
+        return await _cmd_add_feed(arg)
 
     if command == "!remove-feed":
         return _cmd_remove_feed(arg)
@@ -91,7 +92,7 @@ def _cmd_status() -> str:
     )
 
 
-def _cmd_add_feed(url: str) -> str:
+async def _cmd_add_feed(url: str) -> str:
     if not url:
         return "Usage: !add-feed <url>"
 
@@ -104,10 +105,7 @@ def _cmd_add_feed(url: str) -> str:
         return f"Feed already exists ({status}): {url}"
 
     try:
-        import asyncio
-        import general_logic
-
-        asyncio.get_event_loop().run_until_complete(general_logic.add_new_website(url))
+        await general_logic.add_new_website(url)
         return f"Feed added: {url}"
     except Exception as exc:
         return f"Failed to add feed: {exc}"

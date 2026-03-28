@@ -221,7 +221,7 @@ class MatrixNotifier(Notifier):
 
             asyncio.get_event_loop().create_task(self._client.join(room.room_id))
 
-    def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
+    async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
         """
         Receive a message, dispatch it through the command handler, and reply.
 
@@ -231,7 +231,6 @@ class MatrixNotifier(Notifier):
         if event.sender == self._client.user_id:
             return
 
-        # DM-only as I can't be bothered to handle room nonsense right now
         if len(room.users) != 2:
             return
 
@@ -239,20 +238,16 @@ class MatrixNotifier(Notifier):
         if not body:
             return
 
-        response = dispatch(sender=event.sender, body=body)
+        response = await dispatch(sender=event.sender, body=body)
         if not response:
             return
 
-        import asyncio
-
-        asyncio.get_event_loop().create_task(
-            self._send_to_room(
-                room.room_id,
-                {
-                    "msgtype": "m.text",
-                    "body": response,
-                },
-            )
+        await self._send_to_room(
+            room.room_id,
+            {
+                "msgtype": "m.text",
+                "body": response,
+            },
         )
 
 
