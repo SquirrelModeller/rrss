@@ -5,9 +5,16 @@ from typing import List
 import item_derivation
 from models import Feed, FeedItem, ParsedFeed, ParsedFeedEntry
 from .database_config import DatabaseConfig
+import os
 
+# NOTE: Claude 4.6 wrote documentation
 
 DB_PATH = "rrss_data.db"
+
+SINK_ENV_MAP: dict[str, str] = {
+    "matrix": "RRSS_ADMIN_MATRIX",
+    "fluxer": "RRSS_ADMIN_FLUXER",
+}
 
 
 def generate_database() -> None:
@@ -66,7 +73,31 @@ def generate_database() -> None:
             """
         )
 
-        conn.commit()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin(
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                name     TEXT NOT NULL UNIQUE,
+                added_at TEXT NOT NULL,
+                added_by TEXT NOT NULL
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS adminIdentity(
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                sink     TEXT NOT NULL,
+                handle   TEXT NOT NULL,
+                UNIQUE(sink, handle),
+                FOREIGN KEY (admin_id) REFERENCES admin(id)
+            )
+            """
+        )
+
+        _bootstrap_admin(cursor)
 
 
 def get_feeds() -> list[Feed]:
@@ -484,6 +515,220 @@ def delete_feed(feed_id: int) -> None:
         )
 
         conn.commit()
+
+
+def is_admin(sink: str, handle: str) -> bool:
+    """Return True if the given sink handle belongs to a known admin."""
+    with _connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 1 FROM adminIdentity
+            WHERE sink = ? AND handle = ?
+            """,
+            (sink, handle),
+        )
+        return cursor.fetchone() is not None
+
+
+def get_admin_by_identity(sink: str, handle: str) -> dict | None:
+    """
+    Return the admin record for a given sink identity, or None.
+    Returned dict keys: id, name, added_at, added_by.
+    """
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.id, a.name, a.added_at, a.added_by
+            FROM admin a
+            JOIN adminIdentity ai ON ai.admin_id = a.id
+            WHERE ai.sink = ? AND ai.handle = ?
+            """,
+            (sink, handle),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def add_admin(
+    name: str, sink: str, handle: str, added_by_name: str
+) -> tuple[bool, str]:
+    """
+    Add an admin identity.
+
+    - If `name` doesn't exist yet, creates the admin row first.
+    - If the (sink, handle) pair already exists anywhere, returns (False, reason).
+
+    Returns (True, "") on success, (False, reason) on failure.
+    added_by_name is the name field of the admin issuing the command.
+    """
+    now = _utc_now().isoformat()
+
+    with _connect() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT a.name FROM admin a
+            JOIN adminIdentity ai ON ai.admin_id = a.id
+            WHERE ai.sink = ? AND ai.handle = ?
+            """,
+            (sink, handle),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            return (
+                False,
+                f"{handle} is already registered to admin '{existing[0]}' on {sink}.",
+            )
+
+        cursor.execute(
+            "INSERT OR IGNORE INTO admin(name, added_at, added_by) VALUES (?, ?, ?)",
+            (name, now, added_by_name),
+        )
+        cursor.execute("SELECT id FROM admin WHERE name = ?", (name,))
+        row = cursor.fetchone()
+        if row is None:
+            return False, "Failed to create admin record."
+        admin_id = row[0]
+
+        cursor.execute(
+            "INSERT INTO adminIdentity(admin_id, sink, handle) VALUES (?, ?, ?)",
+            (admin_id, sink, handle),
+        )
+        conn.commit()
+
+    return True, ""
+
+
+def remove_admin_identity(sink: str, handle: str) -> tuple[bool, str]:
+    """
+    Remove a single sink identity.
+
+    If this was the admin's last identity the admin row is also removed
+    an admin with no handles is unreachable and shouldn't linger.
+
+    Returns (True, info_message) or (False, error_message).
+    """
+    with _connect() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT ai.id, ai.admin_id, a.name
+            FROM adminIdentity ai
+            JOIN admin a ON a.id = ai.admin_id
+            WHERE ai.sink = ? AND ai.handle = ?
+            """,
+            (sink, handle),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return False, f"No {sink} identity found for handle: {handle}"
+
+        identity_id, admin_id, admin_name = row
+
+        cursor.execute("DELETE FROM adminIdentity WHERE id = ?", (identity_id,))
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM adminIdentity WHERE admin_id = ?", (admin_id,)
+        )
+        remaining = cursor.fetchone()[0]
+
+        if remaining == 0:
+            cursor.execute("DELETE FROM admin WHERE id = ?", (admin_id,))
+            conn.commit()
+            return (
+                True,
+                f"Removed {handle} from {sink}. "
+                f"Admin '{admin_name}' had no remaining identities and was also removed.",
+            )
+
+        conn.commit()
+        return (
+            True,
+            f"Removed {handle} from {sink}. "
+            f"Admin '{admin_name}' still has {remaining} other identity/identities.",
+        )
+
+
+def list_admins() -> list[dict]:
+    """
+    Return all admins with their identities grouped.
+
+    Each dict: { name, added_at, added_by, identities: [ {sink, handle}, ... ] }
+    """
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id, name, added_at, added_by FROM admin ORDER BY added_at"
+        )
+        admins = [dict(row) for row in cursor.fetchall()]
+
+        for admin in admins:
+            cursor.execute(
+                "SELECT sink, handle FROM adminIdentity WHERE admin_id = ? ORDER BY sink",
+                (admin["id"],),
+            )
+            admin["identities"] = [dict(r) for r in cursor.fetchall()]
+
+        return admins
+
+
+def _bootstrap_admin(cursor: sqlite3.Cursor) -> None:
+    """
+    Seed the first admin from environment variables if no admins exist yet.
+
+    Required env var:
+        RRSS_ADMIN_NAME: canonical label for the admin (e.g. "squirrel")
+
+    Optional per-sink env vars (set whichever apply):
+        RRSS_ADMIN_MATRIX: Matrix MXID  e.g. @squirrel:crispy-caesus.eu
+        RRSS_ADMIN_FLUXER: Fluxer handle e.g. squirrel@fluxer.social
+
+    Safe to call on every startup: INSERT OR IGNORE means it only fires once.
+    """
+    name = os.environ.get("RRSS_ADMIN_NAME", "").strip()
+    if not name:
+        return
+
+    identities: list[tuple[str, str]] = []
+    for sink, env_var in SINK_ENV_MAP.items():
+        handle = os.environ.get(env_var, "").strip()
+        if handle:
+            identities.append((sink, handle))
+
+    if not identities:
+        return
+
+    now = _utc_now().isoformat()
+
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO admin(name, added_at, added_by)
+        VALUES (?, ?, ?)
+        """,
+        (name, now, "bootstrap"),
+    )
+
+    cursor.execute("SELECT id FROM admin WHERE name = ?", (name,))
+    row = cursor.fetchone()
+    if row is None:
+        return
+    admin_id = row[0]
+
+    for sink, handle in identities:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO adminIdentity(admin_id, sink, handle)
+            VALUES (?, ?, ?)
+            """,
+            (admin_id, sink, handle),
+        )
 
 
 def _feed_from_row(row: tuple) -> Feed:

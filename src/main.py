@@ -67,8 +67,12 @@ async def main(url: str | None = None) -> None:
     )
     notification_task = asyncio.create_task(run_notification_dispatcher(notifier))
 
+    listener_task = asyncio.create_task(notifier.start_listener())
+
     try:
-        await asyncio.gather(scheduler_task, reconcile_task, notification_task)
+        await asyncio.gather(
+            scheduler_task, reconcile_task, notification_task, listener_task
+        )
     finally:
         reconcile_task.cancel()
         scheduler_task.cancel()
@@ -77,6 +81,7 @@ async def main(url: str | None = None) -> None:
         await runner.close()
         await scheduler.close()
         await notifier.close()
+        listener_task.cancel()
 
 
 def parse_args():

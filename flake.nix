@@ -66,7 +66,6 @@
       ...
     }: let
       cfg = config.services.rrss;
-
       pythonEnv = pkgs.python312.withPackages (ps:
         with ps; [
           requests
@@ -85,7 +84,8 @@
             type = types.path;
             description = ''
               Path to a file containing environment variables (one KEY=value per line).
-              Must include: MATRIX_HOMESERVER, MATRIX_USER_ID, MATRIX_PASSWORD, MATRIX_ROOM_ID.
+              Must include: MATRIX_HOMESERVER, MATRIX_USER_ID, MATRIX_PASSWORD, MATRIX_ROOM_IDS.
+              For admin bootstrap, also include: RRSS_ADMIN_NAME, RRSS_ADMIN_MATRIX.
               Example path: /run/secrets/rrss-env
             '';
           };
@@ -119,35 +119,40 @@
           users.groups.${cfg.group} = {};
 
           systemd.services.rrss = {
-            description = "RRSS RSS-to-Sink notification daemon";
+            description = "RRSS RSS-to-sink notification daemon";
             wantedBy = ["multi-user.target"];
             after = ["network-online.target"];
             requires = ["network-online.target"];
-
             serviceConfig = {
               User = cfg.user;
               Group = cfg.group;
               WorkingDirectory = cfg.stateDir;
-
-              # Secrets are injected here, systemd reads the file and
-              # puts each KEY=value into the process environment.
               EnvironmentFile = cfg.environmentFile;
-
               Environment = [
                 "RRSS_STATE_DIR=${cfg.stateDir}"
               ];
-
-              ExecStart = "${pythonEnv}/bin/python ${self}src/main.py";
-
+              ExecStart = "${pythonEnv}/bin/python ${self}/src/main.py";
               Restart = "on-failure";
               RestartSec = "10s";
-
               PrivateTmp = true;
               NoNewPrivileges = true;
               ProtectSystem = "strict";
               ReadWritePaths = [cfg.stateDir];
             };
           };
+
+          environment.systemPackages = [
+            (pkgs.writeShellScriptBin "rrss-verify" ''
+              exec systemd-run \
+                --uid=${cfg.user} \
+                --gid=${cfg.group} \
+                --working-directory=${cfg.stateDir} \
+                --pty --wait \
+                --setenv=RRSS_STATE_DIR=${cfg.stateDir} \
+                --property=EnvironmentFile=${cfg.environmentFile} \
+                ${pythonEnv}/bin/python ${self}/src/main.py verify
+            '')
+          ];
         };
       };
   };

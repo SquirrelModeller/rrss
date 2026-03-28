@@ -3,15 +3,21 @@ import json
 import os
 from typing import Optional
 
+# NOTE: Claude 4.6 wrote documentation
+
 from nio import (
     AsyncClient,
     AsyncClientConfig,
     LoginResponse,
     RoomSendError,
+    InviteMemberEvent,
+    RoomMessageText,
+    MatrixRoom,
 )
 
 from sinks.base import Notifier
 from models import NotificationMessage, SendResult, SendStatus
+from sinks.matrix.command_handler import dispatch
 
 
 class MatrixNotifier(Notifier):
@@ -178,6 +184,76 @@ class MatrixNotifier(Notifier):
 
         self._ready = True
         return True
+
+    async def start_listener(self) -> None:
+        """
+        Register DM callbacks and run the sync loop.
+
+        This is a long-running coroutine, schedule it as an asyncio Task
+        alongside the scheduler, reconciler, and notification dispatcher.
+
+        sync_forever() drives all event callbacks including encrypted message
+        decryption; it also handles key uploads automatically.
+        """
+        if not self._ready:
+            ok = await self._connect()
+            if not ok:
+                print("[MatrixNotifier] Cannot start listener: login failed.")
+                return
+
+        self._client.add_event_callback(self._on_invite, InviteMemberEvent)
+        self._client.add_event_callback(self._on_message, RoomMessageText)
+
+        print("[MatrixNotifier] DM listener started.")
+        await self._client.sync_forever(timeout=30_000, full_state=True)
+
+    def _on_invite(self, room: MatrixRoom, event: InviteMemberEvent) -> None:
+        """
+        Auto-accept any room invite directed at the bot.
+
+        In practice this fires when an admin opens a fresh DM, Matrix sends
+        an invite before the bot can join.  We accept unconditionally here;
+        command authorisation is enforced in _on_message by checking is_admin().
+        """
+        if event.state_key == self._client.user_id:
+            print(f"[MatrixNotifier] Accepting invite to {room.room_id}")
+            import asyncio
+
+            asyncio.get_event_loop().create_task(self._client.join(room.room_id))
+
+    def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
+        """
+        Receive a message, dispatch it through the command handler, and reply.
+
+        Only fires for rooms with exactly 2 members (us + sender) to restrict
+        the bot to DMs. Commands in group rooms are silently ignored.
+        """
+        if event.sender == self._client.user_id:
+            return
+
+        # DM-only as I can't be bothered to handle room nonsense right now
+        if len(room.users) != 2:
+            return
+
+        body = event.body.strip()
+        if not body:
+            return
+
+        response = dispatch(sender=event.sender, body=body)
+        if not response:
+            return
+
+        import asyncio
+
+        asyncio.get_event_loop().create_task(
+            self._send_to_room(
+                room.room_id,
+                {
+                    "msgtype": "m.text",
+                    "body": response,
+                },
+            )
+        )
 
 
 def _encryption_available() -> bool:
