@@ -3,8 +3,6 @@ import json
 import os
 from typing import Optional
 
-# NOTE: Claude 4.6 wrote documentation
-
 from nio import (
     AsyncClient,
     AsyncClientConfig,
@@ -15,22 +13,25 @@ from nio import (
     MatrixRoom,
 )
 
-from sinks.base import Notifier
+from sinks.base import Sink
 from models import NotificationMessage, SendResult, SendStatus
-from sinks.matrix.command_handler import dispatch
+from sinks.command_handler import dispatch
+
+SINK_NAME = "matrix"
 
 
-class MatrixNotifier(Notifier):
+class MatrixSink(Sink):
     """
-    Sends notifications to one or more Matrix rooms as formatted messages.
+    Matrix sink: sends feed notifications to configured rooms and listens
+    for DM commands, dispatching them through the shared command handler.
 
-    One AsyncClient / one login - messages are sent out to every room_id
-    in the list.  The overall SendResult reflects the worst outcome across
-    all rooms: SUCCESS only if every room succeeded, RETRY if any room had
-    a transient failure, FAILURE if all rooms failed permanently.
+    Notification fan-out: send() broadcasts to every room_id in the list.
+    Command replies:      reply() sends a response back to a single room.
+    Event loop:           start_listener() drives sync_forever() and handles
+                          invite acceptance and inbound message dispatch.
 
     Supports E2E encryption if the nio[e2e] extras are installed and
-    a store_path is provided.  Falls back gracefully to unencrypted if
+    a store_path is provided. Falls back gracefully to unencrypted if
     encryption is unavailable.
     """
 
@@ -47,7 +48,7 @@ class MatrixNotifier(Notifier):
         ignore_unverified_devices: bool = True,
     ) -> None:
         if not room_ids:
-            raise ValueError("MatrixNotifier requires at least one room_id")
+            raise ValueError("MatrixSink requires at least one room_id")
 
         self._homeserver = homeserver
         self._user_id = user_id
@@ -62,6 +63,7 @@ class MatrixNotifier(Notifier):
         self._ready = False
 
     async def send(self, message: NotificationMessage) -> SendResult:
+        """Fan-out a notification to all configured Matrix rooms."""
         if not self._ready:
             ok = await self._connect()
             if not ok:
@@ -84,6 +86,35 @@ class MatrixNotifier(Notifier):
         )
 
         return _aggregate_results(results)
+
+    async def reply(self, recipient: str, text: str) -> None:
+        """Send a command response back to the room the command arrived from."""
+        await self._send_to_room(
+            recipient,
+            {"msgtype": "m.text", "body": text},
+        )
+
+    async def start_listener(self) -> None:
+        """
+        Register DM callbacks and run the sync loop.
+
+        This is a long-running coroutine; schedule it as an asyncio Task
+        alongside the scheduler, reconciler, and notification dispatcher.
+
+        sync_forever() drives all event callbacks including encrypted message
+        decryption and handles key uploads automatically.
+        """
+        if not self._ready:
+            ok = await self._connect()
+            if not ok:
+                print("[MatrixSink] Cannot start listener: login failed.")
+                return
+
+        self._client.add_event_callback(self._on_invite, InviteMemberEvent)
+        self._client.add_event_callback(self._on_message, RoomMessageText)
+
+        print("[MatrixSink] DM listener started.")
+        await self._client.sync_forever(timeout=30_000, full_state=True)
 
     async def close(self) -> None:
         if self._client is not None:
@@ -145,11 +176,11 @@ class MatrixNotifier(Notifier):
                     await self._client.keys_upload()
 
                 self._ready = True
-                print("Connected to matrix!")
+                print("[MatrixSink] Connected using saved credentials.")
                 return True
 
             except Exception as exc:
-                print(f"[MatrixNotifier] Could not restore credentials: {exc}")
+                print(f"[MatrixSink] Could not restore credentials: {exc}")
 
         self._client = AsyncClient(
             self._homeserver,
@@ -160,7 +191,7 @@ class MatrixNotifier(Notifier):
 
         resp = await self._client.login(self._password, device_name=self._device_name)
         if not isinstance(resp, LoginResponse):
-            print(f"[MatrixNotifier] Login failed: {resp}")
+            print(f"[MatrixSink] Login failed: {resp}")
             return False
 
         try:
@@ -175,7 +206,7 @@ class MatrixNotifier(Notifier):
                     f,
                 )
         except Exception as exc:
-            print(f"[MatrixNotifier] Could not save credentials: {exc}")
+            print(f"[MatrixSink] Could not save credentials: {exc}")
 
         await self._client.sync(timeout=5000, full_state=True)
 
@@ -185,45 +216,22 @@ class MatrixNotifier(Notifier):
         self._ready = True
         return True
 
-    async def start_listener(self) -> None:
-        """
-        Register DM callbacks and run the sync loop.
-
-        This is a long-running coroutine, schedule it as an asyncio Task
-        alongside the scheduler, reconciler, and notification dispatcher.
-
-        sync_forever() drives all event callbacks including encrypted message
-        decryption; it also handles key uploads automatically.
-        """
-        if not self._ready:
-            ok = await self._connect()
-            if not ok:
-                print("[MatrixNotifier] Cannot start listener: login failed.")
-                return
-
-        self._client.add_event_callback(self._on_invite, InviteMemberEvent)
-        self._client.add_event_callback(self._on_message, RoomMessageText)
-
-        print("[MatrixNotifier] DM listener started.")
-        await self._client.sync_forever(timeout=30_000, full_state=True)
-
     def _on_invite(self, room: MatrixRoom, event: InviteMemberEvent) -> None:
         """
         Auto-accept any room invite directed at the bot.
 
-        In practice this fires when an admin opens a fresh DM, Matrix sends
-        an invite before the bot can join.  We accept unconditionally here;
-        command authorisation is enforced in _on_message by checking is_admin().
+        Fires when an admin opens a fresh DM - Matrix sends an invite before
+        the bot can join. Accepted unconditionally here; command authorisation
+        is enforced in _on_message via is_admin() in the dispatcher.
         """
         if event.state_key == self._client.user_id:
-            print(f"[MatrixNotifier] Accepting invite to {room.room_id}")
-            import asyncio
-
+            print(f"[MatrixSink] Accepting invite to {room.room_id}")
             asyncio.get_event_loop().create_task(self._client.join(room.room_id))
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
         """
-        Receive a message, dispatch it through the command handler, and reply.
+        Receive a message, dispatch it through the shared command handler,
+        and reply to the same room.
 
         Only fires for rooms with exactly 2 members (us + sender) to restrict
         the bot to DMs. Commands in group rooms are silently ignored.
@@ -238,17 +246,11 @@ class MatrixNotifier(Notifier):
         if not body:
             return
 
-        response = await dispatch(sender=event.sender, body=body)
+        response = await dispatch(sink=SINK_NAME, sender=event.sender, body=body)
         if not response:
             return
 
-        await self._send_to_room(
-            room.room_id,
-            {
-                "msgtype": "m.text",
-                "body": response,
-            },
-        )
+        await self.reply(room.room_id, response)
 
 
 def _encryption_available() -> bool:
@@ -320,5 +322,3 @@ def _format_message(msg: NotificationMessage) -> tuple[str, str]:
         html_parts.append(f'<p><a href="{e_url}">Open article</a></p>')
 
     return plain, "".join(html_parts)
-
-    return plain, html

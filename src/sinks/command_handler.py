@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import re
 
-from database import *
+from database import database
 import general_logic
 
-SINK = "matrix"
-
-# NOTE: Claude 4.6 wrote documentation, HELP_TEXT and MXID_RE
 MXID_RE = re.compile(r"^@[^:@\s]+:[^:@\s]+\.[^:@\s]+$")
 
 HELP_TEXT = """\
@@ -22,11 +19,12 @@ HELP_TEXT = """\
 """
 
 
-async def dispatch(sender: str, body: str) -> str:
+async def dispatch(sink: str, sender: str, body: str) -> str:
     """
-    Main entry point.
+    Main entry point for all sinks.
 
-    sender - the sink-specific handle of the message author (e.g. MXID)
+    sink   - the name of the sink the command arrived on (e.g. "matrix", "fluxer")
+    sender - the sink-specific handle of the message author (e.g. MXID, email)
     body   - raw message text
 
     Returns a response string, or "" to send nothing (non-command messages
@@ -37,10 +35,10 @@ async def dispatch(sender: str, body: str) -> str:
     if not body.startswith("!"):
         return ""
 
-    if not database.is_admin(SINK, sender):
+    if not database.is_admin(sink, sender):
         return "Sorry, you are not authorised to control this bot."
 
-    admin = database.get_admin_by_identity(SINK, sender)
+    admin = database.get_admin_by_identity(sink, sender)
     issuer_name = admin["name"] if admin else "unknown"
 
     parts = body.split(maxsplit=1)
@@ -66,7 +64,7 @@ async def dispatch(sender: str, body: str) -> str:
         return _cmd_add_admin(arg, issuer_name)
 
     if command == "!remove-admin":
-        return _cmd_remove_admin(arg, sender)
+        return _cmd_remove_admin(arg, sink, sender)
 
     if command == "!list-admins":
         return _cmd_list_admins()
@@ -165,7 +163,7 @@ def _cmd_add_admin(arg: str, issuer_name: str) -> str:
     return f"Admin added: {name} ({sink}: {handle})"
 
 
-def _cmd_remove_admin(arg: str, sender: str) -> str:
+def _cmd_remove_admin(arg: str, sink: str, sender: str) -> str:
     """
     Syntax: !remove-admin <sink> <handle>
 
@@ -177,13 +175,13 @@ def _cmd_remove_admin(arg: str, sender: str) -> str:
     if len(parts) != 2:
         return "Usage: !remove-admin <sink> <handle>"
 
-    sink, handle = parts
-    sink = sink.lower()
+    target_sink, handle = parts
+    target_sink = target_sink.lower()
 
-    if sink == SINK and handle == sender:
+    if target_sink == sink and handle == sender:
         return "You cannot remove your own identity."
 
-    ok, message = database.remove_admin_identity(sink, handle)
+    ok, message = database.remove_admin_identity(target_sink, handle)
     return message
 
 

@@ -7,9 +7,7 @@ import general_logic
 from jobs.feed_jobs import FeedJobRunner
 from scheduler import Scheduler
 from jobs.notification_jobs import run_notification_dispatcher
-
-from sinks.matrix.matrix import MatrixNotifier
-from sinks.matrix.matrix_config import MatrixConfig
+from sinks.registry import load_sinks
 
 
 async def reconcile_feeds(
@@ -41,17 +39,7 @@ async def main(url: str | None = None) -> None:
         await general_logic.add_new_website(url)
         return
 
-    matrix_cfg = MatrixConfig.from_env()
-    notifier = MatrixNotifier(
-        homeserver=matrix_cfg.homeserver,
-        user_id=matrix_cfg.user_id,
-        password=matrix_cfg.password,
-        room_ids=matrix_cfg.room_ids,
-        store_path=matrix_cfg.store_path,
-        cred_file=matrix_cfg.cred_file,
-        device_name=matrix_cfg.device_name,
-        ignore_unverified_devices=matrix_cfg.ignore_unverified_devices,
-    )
+    sinks = load_sinks()
 
     runner = FeedJobRunner()
     await runner.start()
@@ -61,27 +49,29 @@ async def main(url: str | None = None) -> None:
     for feed in database.get_all_active_feeds():
         scheduler.schedule_at(feed.id, feed.next_check_at)
 
+    listener_tasks = [asyncio.create_task(sink.start_listener()) for sink in sinks]
+
     scheduler_task = asyncio.create_task(scheduler.run_forever())
     reconcile_task = asyncio.create_task(
         reconcile_feeds(scheduler, interval_seconds=15)
     )
-    notification_task = asyncio.create_task(run_notification_dispatcher(notifier))
-
-    listener_task = asyncio.create_task(notifier.start_listener())
+    notification_task = asyncio.create_task(run_notification_dispatcher(sinks))
 
     try:
         await asyncio.gather(
-            scheduler_task, reconcile_task, notification_task, listener_task
+            scheduler_task, reconcile_task, notification_task, *listener_tasks
         )
     finally:
         reconcile_task.cancel()
         scheduler_task.cancel()
         notification_task.cancel()
+        for t in listener_tasks:
+            t.cancel()
 
         await runner.close()
         await scheduler.close()
-        await notifier.close()
-        listener_task.cancel()
+        for sink in sinks:
+            await sink.close()
 
 
 def parse_args():
